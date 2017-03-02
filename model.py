@@ -75,13 +75,20 @@ class LSTMPolicy(object):
         self.sample = categorical_sample(self.logits, ac_space)[0, :]
         self.var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, tf.get_variable_scope().name)
 
+        self._last_state = self.get_initial_features()
+
     def get_initial_features(self):
         return self.state_init
 
-    def act(self, ob, c, h):
+    def act(self, ob, c, h, track_state=True):
         sess = tf.get_default_session()
-        return sess.run([self.sample, self.vf] + self.state_out,
-                        {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})
+        fetched = sess.run([self.sample, self.vf, self.logits] + self.state_out,
+                           {self.x: [ob], self.state_in[0]: c, self.state_in[1]: h})
+
+        if track_state:
+            self._last_state = fetched[3:]
+
+        return fetched
 
     def value(self, ob, c, h):
         sess = tf.get_default_session()

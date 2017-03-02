@@ -17,6 +17,10 @@ parser.add_argument('-n', '--dry-run', action='store_true',
                     help="Print out commands rather than executing them")
 parser.add_argument('-m', '--mode', type=str, default='tmux',
                     help="tmux: run workers in a tmux session. nohup: run workers with nohup. child: run workers as child processes")
+parser.add_argument('--freeze', action='store_true', help='Freeze model')
+parser.add_argument('--adversarial-mode', type=str, default=None,
+                    help="Adversarial mode (random, fgsm, optimization)")
+parser.add_argument('--adversarial-epsilon', type=float, default=0.01)
 
 
 def new_cmd(session, name, cmd, mode, logdir, shell):
@@ -30,13 +34,27 @@ def new_cmd(session, name, cmd, mode, logdir, shell):
         return name, "nohup {} -c {} >{}/{}.{}.out 2>&1 & echo kill $! >>{}/kill.sh".format(shell, shlex_quote(cmd), logdir, session, name, logdir)
 
 
-def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash', mode='tmux'):
+def create_commands(session, args, shell='bash'):
+    num_workers = args.num_workers
+    remotes = args.remotes
+    env_id = args.env_id
+    logdir = args.log_dir
+    mode = args.mode
+
     # for launching the TF workers and for launching tensorboard
     base_cmd = [
         'CUDA_VISIBLE_DEVICES=',
         sys.executable, 'worker.py',
         '--log-dir', logdir, '--env-id', env_id,
-        '--num-workers', str(num_workers)]
+        '--num-workers', str(num_workers)
+    ]
+
+    if args.freeze:
+        base_cmd += ['--freeze']
+    if args.adversarial_mode:
+        base_cmd += ['--adversarial-mode', args.adversarial_mode]
+    if args.adversarial_epsilon:
+        base_cmd += ['--adversarial-epsilon', str(args.adversarial_epsilon)]
 
     if remotes is None:
         remotes = ["1"] * num_workers
@@ -46,8 +64,13 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
 
     cmds_map = [new_cmd(session, "ps", base_cmd + ["--job-name", "ps"], mode, logdir, shell)]
     for i in range(num_workers):
-        cmds_map += [new_cmd(session,
-            "w-%d" % i, base_cmd + ["--job-name", "worker", "--task", str(i), "--remotes", remotes[i]], mode, logdir, shell)]
+        cmds_map += [
+            new_cmd(
+                session,
+                "w-%d" % i, base_cmd + ["--job-name", "worker", "--task", str(i), "--remotes", remotes[i]],
+                mode, logdir, shell
+            )
+        ]
 
     cmds_map += [new_cmd(session, "tb", ["tensorboard", "--logdir", logdir, "--port", "12345"], mode, logdir, shell)]
     if mode == 'tmux':
@@ -58,7 +81,11 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
     notes = []
     cmds = [
         "mkdir -p {}".format(logdir),
-        "echo {} {} > {}/cmd.sh".format(sys.executable, ' '.join([shlex_quote(arg) for arg in sys.argv if arg != '-n']), logdir),
+        "echo {} {} > {}/cmd.sh".format(
+            sys.executable,
+            ' '.join([shlex_quote(arg) for arg in sys.argv if arg != '-n']),
+            logdir
+        ),
     ]
     if mode == 'nohup' or mode == 'child':
         cmds += ["echo '#!/bin/sh' >{}/kill.sh".format(logdir)]
@@ -72,8 +99,8 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
 
     if mode == 'tmux':
         cmds += [
-        "tmux kill-session -t {}".format(session),
-        "tmux new-session -s {} -n {} -d {}".format(session, windows[0], shell)
+            "tmux kill-session -t {}".format(session),
+            "tmux new-session -s {} -n {} -d {}".format(session, windows[0], shell)
         ]
         for w in windows[1:]:
             cmds += ["tmux new-window -t {} -n {} {}".format(session, w, shell)]
@@ -86,7 +113,7 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
 
 def run():
     args = parser.parse_args()
-    cmds, notes = create_commands("a3c", args.num_workers, args.remotes, args.env_id, args.log_dir, mode=args.mode)
+    cmds, notes = create_commands("a3c", args)
     if args.dry_run:
         print("Dry-run mode due to -n flag, otherwise the following commands would be executed:")
     else:

@@ -1,18 +1,82 @@
+import logging
+import time
+
 import cv2
 from gym.spaces.box import Box
 import numpy as np
 import gym
 from gym import spaces
-import logging
+from gym.envs.registration import register
+
 import universe
 from universe import vectorized
 from universe.wrappers import BlockingReset, GymCoreAction, EpisodeID, Unvectorize, Vectorize, Vision, Logger
 from universe import spaces as vnc_spaces
 from universe.spaces.vnc_event import keycode
-import time
+
+import tensorflow as tf
+
+from adversarial import RandomNoiseWrapper, FGSMNoiseWrapper
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 universe.configure_logging()
+
+# Register custom environments.
+register(
+    id='CartPolePixels-v0',
+    entry_point='pixels.cartpole:CartPolePixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 200},
+    reward_threshold=195.0,
+)
+
+register(
+    id='CartPolePixels-IncreasedGravity-v0',
+    entry_point='pixels.cartpole:CartPolePixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 200},
+    kwargs={
+        'gravity': 20.0,
+    },
+    reward_threshold=195.0,
+)
+
+register(
+    id='CartPolePixels-DecreasedGravity-v0',
+    entry_point='pixels.cartpole:CartPolePixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 200},
+    kwargs={
+        'gravity': 5.0,
+    },
+    reward_threshold=195.0,
+)
+
+register(
+    id='CartPolePixels-IncreasedCartMass-v0',
+    entry_point='pixels.cartpole:CartPolePixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 200},
+    kwargs={
+        'mass_cart': 2.0,
+    },
+    reward_threshold=195.0,
+)
+
+register(
+    id='CartPolePixels-IncreasedPoleMass-v0',
+    entry_point='pixels.cartpole:CartPolePixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 200},
+    kwargs={
+        'mass_pole': 0.3,
+    },
+    reward_threshold=195.0,
+)
+
+register(
+    id='CarRacingPixels-v0',
+    entry_point='pixels.car_racing:CarRacingPixelsEnv',
+    tags={'wrapper_config.TimeLimit.max_episode_steps': 1000},
+    reward_threshold=900,
+)
+
 
 def create_env(env_id, client_id, remotes, **kwargs):
     spec = gym.spec(env_id)
@@ -24,9 +88,51 @@ def create_env(env_id, client_id, remotes, **kwargs):
     else:
         # Assume atari.
         assert "." not in env_id  # universe environments have dots in names.
-        return create_atari_env(env_id)
 
-def create_flash_env(env_id, client_id, remotes, **_):
+        if env_id.startswith('CartPolePixels-') or env_id.startswith('CarRacingPixels-'):
+            return create_pixels_env(env_id, **kwargs)
+        else:
+            return create_atari_env(env_id, **kwargs)
+
+
+def create_adversarial_env(env, adversarial_mode=None, adversarial_epsilon=0.01, refs=None, **kwargs):
+    """
+    Create an adversarial environment.
+    """
+
+    setup_functions = []
+
+    def adversary_setup(*args, **kwargs):
+        for function in setup_functions:
+            function(*args, **kwargs)
+
+    if adversarial_mode == 'random':
+        env = RandomNoiseWrapper(env, intensity=adversarial_epsilon)
+    elif adversarial_mode == 'fgsm':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon)
+        setup_functions.append(env.setup)
+    elif adversarial_mode == 'fgsm_skip5':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon, skip=5)
+        setup_functions.append(env.setup)
+    elif adversarial_mode == 'fgsm_skip10':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon, skip=10)
+        setup_functions.append(env.setup)
+    elif adversarial_mode == 'fgsm_reuse5':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon, skip=5, reuse=True)
+        setup_functions.append(env.setup)
+    elif adversarial_mode == 'fgsm_reuse10':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon, skip=10, reuse=True)
+        setup_functions.append(env.setup)
+    elif adversarial_mode == 'fgsm_vf':
+        env = FGSMNoiseWrapper(env, intensity=adversarial_epsilon, vf=True)
+        setup_functions.append(env.setup)
+
+    refs['adversary_setup'] = adversary_setup
+
+    return env
+
+
+def create_flash_env(env_id, client_id, remotes, **kwargs):
     env = gym.make(env_id)
     env = Vision(env)
     env = Logger(env)
@@ -47,6 +153,7 @@ def create_flash_env(env_id, client_id, remotes, **_):
     env = DiscreteToFixedKeysVNCActions(env, keys)
     env = EpisodeID(env)
     env = DiagnosticsInfo(env)
+    env = create_adversarial_env(env, **kwargs)
     env = Unvectorize(env)
     env.configure(fps=5.0, remotes=remotes, start_timeout=15 * 60, client_id=client_id,
                   vnc_driver='go', vnc_kwargs={
@@ -54,7 +161,8 @@ def create_flash_env(env_id, client_id, remotes, **_):
                     'fine_quality_level': 50, 'subsample_level': 3})
     return env
 
-def create_vncatari_env(env_id, client_id, remotes, **_):
+
+def create_vncatari_env(env_id, client_id, remotes, **kwargs):
     env = gym.make(env_id)
     env = Vision(env)
     env = Logger(env)
@@ -63,6 +171,7 @@ def create_vncatari_env(env_id, client_id, remotes, **_):
     env = AtariRescale42x42(env)
     env = EpisodeID(env)
     env = DiagnosticsInfo(env)
+    env = create_adversarial_env(env, **kwargs)
     env = Unvectorize(env)
 
     logger.info('Connecting to remotes: %s', remotes)
@@ -70,16 +179,35 @@ def create_vncatari_env(env_id, client_id, remotes, **_):
     env.configure(remotes=remotes, start_timeout=15 * 60, fps=fps, client_id=client_id)
     return env
 
-def create_atari_env(env_id):
+
+def create_atari_env(env_id, **kwargs):
     env = gym.make(env_id)
+
+    # Seed.
+    env.seed(0)
+    np.random.seed(0)
+    tf.set_random_seed(0)
+
     env = Vectorize(env)
     env = AtariRescale42x42(env)
+    env = create_adversarial_env(env, **kwargs)
     env = DiagnosticsInfo(env)
     env = Unvectorize(env)
     return env
 
+
+def create_pixels_env(env_id, **kwargs):
+    env = gym.make(env_id)
+    env = Vectorize(env)
+    env = create_adversarial_env(env, **kwargs)
+    env = DiagnosticsInfo(env)
+    env = Unvectorize(env)
+    return env
+
+
 def DiagnosticsInfo(env, *args, **kwargs):
     return vectorized.VectorizeFilter(env, DiagnosticsInfoI, *args, **kwargs)
+
 
 class DiagnosticsInfoI(vectorized.Filter):
     def __init__(self, log_interval=503):
@@ -94,12 +222,14 @@ class DiagnosticsInfoI(vectorized.Filter):
         self._all_rewards = []
         self._num_vnc_updates = 0
         self._last_episode_id = -1
+        self._adversary = {}
 
     def _after_reset(self, observation):
         logger.info('Resetting environment')
         self._episode_reward = 0
         self._episode_length = 0
         self._all_rewards = []
+        self._adversary = {}
         return observation
 
     def _after_step(self, observation, reward, done, info):
@@ -152,18 +282,30 @@ class DiagnosticsInfoI(vectorized.Filter):
                 self._episode_length += 1
             self._all_rewards.append(reward)
 
+        for key, value in info.items():
+            if key.startswith('adversary/'):
+                self._adversary.setdefault(key, []).append(value)
+
         if done:
-            logger.info('Episode terminating: episode_reward=%s episode_length=%s', self._episode_reward, self._episode_length)
+            logger.info('Episode terminating: episode_reward={} episode_length={}'.format(
+                self._episode_reward, self._episode_length
+            ))
             total_time = time.time() - self._episode_time
             to_log["global/episode_reward"] = self._episode_reward
             to_log["global/episode_length"] = self._episode_length
             to_log["global/episode_time"] = total_time
             to_log["global/reward_per_time"] = self._episode_reward / total_time
+
+            for key, value in self._adversary.items():
+                to_log[key] = np.average(value)
+
             self._episode_reward = 0
             self._episode_length = 0
             self._all_rewards = []
+            self._adversary = {}
 
         return observation, reward, done, to_log
+
 
 def _process_frame42(frame):
     frame = frame[34:34+160, :160]
@@ -178,6 +320,7 @@ def _process_frame42(frame):
     frame = np.reshape(frame, [42, 42, 1])
     return frame
 
+
 class AtariRescale42x42(vectorized.ObservationWrapper):
     def __init__(self, env=None):
         super(AtariRescale42x42, self).__init__(env)
@@ -185,6 +328,7 @@ class AtariRescale42x42(vectorized.ObservationWrapper):
 
     def _observation(self, observation_n):
         return [_process_frame42(observation) for observation in observation_n]
+
 
 class FixedKeyState(object):
     def __init__(self, keys):
@@ -208,9 +352,11 @@ class FixedKeyState(object):
                 break
         return action_n
 
+
 class DiscreteToFixedKeysVNCActions(vectorized.ActionWrapper):
     """
-    Define a fixed action space. Action 0 is all keys up. Each element of keys can be a single key or a space-separated list of keys
+    Define a fixed action space. Action 0 is all keys up. Each element of keys can
+    be a single key or a space-separated list of keys
 
     For example,
        e=DiscreteToFixedKeysVNCActions(e, ['left', 'right'])
@@ -247,6 +393,7 @@ class DiscreteToFixedKeysVNCActions(vectorized.ActionWrapper):
         # avoid warnings.
         return [self._actions[int(action)] for action in action_n]
 
+
 class CropScreen(vectorized.ObservationWrapper):
     """Crops out a [height]x[width] area starting from (top,left) """
     def __init__(self, env, height, width, top=0, left=0):
@@ -261,12 +408,14 @@ class CropScreen(vectorized.ObservationWrapper):
         return [ob[self.top:self.top+self.height, self.left:self.left+self.width, :] if ob is not None else None
                 for ob in observation_n]
 
+
 def _process_frame_flash(frame):
     frame = cv2.resize(frame, (200, 128))
     frame = frame.mean(2).astype(np.float32)
     frame *= (1.0 / 255.0)
     frame = np.reshape(frame, [128, 200, 1])
     return frame
+
 
 class FlashRescale(vectorized.ObservationWrapper):
     def __init__(self, env=None):
